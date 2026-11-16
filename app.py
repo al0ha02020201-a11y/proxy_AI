@@ -1,6 +1,6 @@
 import asyncio
 import datetime
-import io
+import gc
 import logging
 import os
 import re
@@ -24,40 +24,46 @@ from aiogram.types import (
 from google import genai
 from google.genai import types as genai_types
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # =====================================================================
-# ⚙️ НАСТРОЙКИ (ЗАПОЛНИТЕ СВОИ ДАННЫЕ)
+# ⚙️ НАСТРОЙКИ
 # =====================================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ВАШ_ТОКЕН_ТЕЛЕГРАМ_БОТА")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "ВАШ_КЛЮЧ_GEMINI_API")
-
-# Укажите ваш Telegram ID (узнать можно у @userinfobot), чтобы работал /admin и алерты
-ADMIN_IDS = [123456789]
+ADMIN_IDS = [123456789]  # Ваш Telegram ID
 
 DEFAULT_MODEL = "gemini-4-hydrogen"
 DB_PATH = "gemini_bot.db"
-HEALTH_CHECK_INTERVAL = 600  # 10 минут (в секундах)
 
-# Настройка логирования
+# Лимиты времени и памяти (1 CPU / 1 GB RAM)
+HEALTH_CHECK_INTERVAL = 600          # Проверка сервера: каждые 10 минут
+CLEANUP_INTERVAL = 1800              # Автоочистка: каждые 30 минут
+CHAT_TTL_SECONDS = 7 * 86400         # Удаление всех диалогов: через 7 дней (1 неделю)
+LARGE_FILE_TTL_SECONDS = 24 * 3600   # Удаление файлов > 10 МБ: через 24 часа
+SMALL_FILE_TTL_SECONDS = 48 * 3600   # Удаление остальных файлов: через 48 часов
+LARGE_FILE_BYTES = 10 * 1024 * 1024  # Порог тяжелого файла: 10 МБ
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# Инициализация бота и клиента Gemini
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Глобальное состояние для мониторинга и кэша
 START_TIME = time.time()
 MODELS_CACHE = []
 HEALTH_STATE = {
     "is_healthy": True,
     "last_error": None,
     "last_ping_ms": 0,
-    "last_check": "Еще не проводилась",
     "alerts_enabled": True,
 }
 
-# Расширения файлов, которые лучше читать напрямую как текст/код
 TEXT_CODE_EXTENSIONS = {
     ".txt", ".py", ".js", ".ts", ".html", ".css", ".json", ".xml", ".yaml", ".yml",
     ".md", ".csv", ".sql", ".sh", ".bat", ".ps1", ".c", ".cpp", ".h", ".hpp",
@@ -65,7 +71,6 @@ TEXT_CODE_EXTENSIONS = {
     ".env", ".dockerfile", ".toml", ".log"
 }
 
-# Соответствие языков программирования расширениям файлов для выгрузки кода
 LANG_EXT_MAP = {
     "python": "py", "py": "py", "javascript": "js", "js": "js",
     "typescript": "ts", "ts": "ts", "html": "html", "css": "css",
@@ -78,10 +83,19 @@ LANG_EXT_MAP = {
 
 
 # =====================================================================
-# 🗄 БАЗА ДАННЫХ (SQLite)
+# 🗄 БАЗА ДАННЫХ (ОПТИМИЗИРОВАНА ПОД 1 ГБ ОЗУ, ИСТОРИЯ ТОЛЬКО В ТЕКСТЕ)
 # =====================================================================
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=FILE;")
+    conn.execute("PRAGMA cache_size=-4000;")  # Не более 4 МБ ОЗУ под кэш БД
+    return conn
+
+
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db() as conn:
         c = conn.cursor()
         c.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -95,7 +109,7 @@ def init_db():
                 chat_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
                 title TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at REAL
             )
         """)
         c.execute("""
@@ -106,6 +120,8 @@ def init_db():
                 text TEXT,
                 file_uri TEXT,
                 file_mime TEXT,
+                file_api_name TEXT,
+                file_size INTEGER DEFAULT 0,
                 created_at REAL
             )
         """)
@@ -123,26 +139,22 @@ def init_db():
 
 
 def ensure_user(user_id: int) -> tuple[str, int]:
-    """Возвращает (current_model, active_chat_id) пользователя. Создает чат, если его нет."""
-    with sqlite3.connect(DB_PATH) as conn:
+    now = time.time()
+    with get_db() as conn:
         c = conn.cursor()
         c.execute("SELECT current_model, active_chat_id FROM users WHERE user_id = ?", (user_id,))
         row = c.fetchone()
         if not row:
-            c.execute("INSERT INTO chats (user_id, title) VALUES (?, ?)", (user_id, "Новый диалог"))
+            c.execute("INSERT INTO chats (user_id, title, created_at) VALUES (?, ?, ?)", (user_id, "Новый диалог", now))
             chat_id = c.lastrowid
-            c.execute(
-                "INSERT INTO users (user_id, current_model, active_chat_id) VALUES (?, ?, ?)",
-                (user_id, DEFAULT_MODEL, chat_id)
-            )
+            c.execute("INSERT INTO users (user_id, current_model, active_chat_id) VALUES (?, ?, ?)", (user_id, DEFAULT_MODEL, chat_id))
             conn.commit()
             return DEFAULT_MODEL, chat_id
 
         model, chat_id = row
-        # Проверяем, существует ли активный чат
         c.execute("SELECT chat_id FROM chats WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
         if not c.fetchone():
-            c.execute("INSERT INTO chats (user_id, title) VALUES (?, ?)", (user_id, "Новый диалог"))
+            c.execute("INSERT INTO chats (user_id, title, created_at) VALUES (?, ?, ?)", (user_id, "Новый диалог", now))
             chat_id = c.lastrowid
             c.execute("UPDATE users SET active_chat_id = ? WHERE user_id = ?", (chat_id, user_id))
             conn.commit()
@@ -150,9 +162,9 @@ def ensure_user(user_id: int) -> tuple[str, int]:
 
 
 def create_new_chat(user_id: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO chats (user_id, title) VALUES (?, ?)", (user_id, "Новый диалог"))
+        c.execute("INSERT INTO chats (user_id, title, created_at) VALUES (?, ?, ?)", (user_id, "Новый диалог", time.time()))
         chat_id = c.lastrowid
         c.execute("UPDATE users SET active_chat_id = ? WHERE user_id = ?", (chat_id, user_id))
         conn.commit()
@@ -160,60 +172,51 @@ def create_new_chat(user_id: int) -> int:
 
 
 def get_user_chats(user_id: int):
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute(
-            "SELECT chat_id, title, created_at FROM chats WHERE user_id = ? ORDER BY chat_id ASC",
-            (user_id,)
-        )
+        c.execute("SELECT chat_id, title, created_at FROM chats WHERE user_id = ? ORDER BY chat_id ASC", (user_id,))
         return c.fetchall()
 
 
 def set_active_chat(user_id: int, chat_id: int):
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("UPDATE users SET active_chat_id = ? WHERE user_id = ?", (chat_id, user_id))
+    with get_db() as conn:
+        conn.execute("UPDATE users SET active_chat_id = ? WHERE user_id = ?", (chat_id, user_id))
         conn.commit()
 
 
 def set_user_model(user_id: int, model_name: str):
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("UPDATE users SET current_model = ? WHERE user_id = ?", (model_name, user_id))
+    with get_db() as conn:
+        conn.execute("UPDATE users SET current_model = ? WHERE user_id = ?", (model_name, user_id))
         conn.commit()
 
 
-def add_message(chat_id: int, role: str, text: str, file_uri: str = None, file_mime: str = None):
-    with sqlite3.connect(DB_PATH) as conn:
+def add_message(chat_id: int, role: str, text: str, file_uri: str = None, file_mime: str = None, file_api_name: str = None, file_size: int = 0) -> int:
+    with get_db() as conn:
         c = conn.cursor()
         c.execute(
-            "INSERT INTO messages (chat_id, role, text, file_uri, file_mime, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, role, text, file_uri, file_mime, time.time())
+            """INSERT INTO messages (chat_id, role, text, file_uri, file_mime, file_api_name, file_size, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (chat_id, role, text, file_uri, file_mime, file_api_name, file_size, time.time())
         )
-        # Если это первое сообщение пользователя, обновим название чата
+        msg_id = c.lastrowid
         if role == "user" and text:
             c.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ?", (chat_id,))
             if c.fetchone()[0] <= 1:
                 clean_title = text.strip().replace("\n", " ")[:35]
-                if len(text) > 35:
-                    clean_title += "..."
                 c.execute("UPDATE chats SET title = ? WHERE chat_id = ?", (clean_title, chat_id))
         conn.commit()
-        return c.lastrowid
+        return msg_id
 
 
 def get_chat_messages(chat_id: int):
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute(
-            "SELECT role, text, file_uri, file_mime, created_at FROM messages WHERE chat_id = ? ORDER BY msg_id ASC",
-            (chat_id,)
-        )
+        c.execute("SELECT role, text, file_uri, file_mime, file_size, created_at FROM messages WHERE chat_id = ? ORDER BY msg_id ASC", (chat_id,))
         return c.fetchall()
 
 
 def get_message_by_id(msg_id: int):
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db() as conn:
         c = conn.cursor()
         c.execute("SELECT text FROM messages WHERE msg_id = ?", (msg_id,))
         row = c.fetchone()
@@ -221,9 +224,8 @@ def get_message_by_id(msg_id: int):
 
 
 def update_stats(req=0, success=0, err=0, files=0):
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("""
+    with get_db() as conn:
+        conn.execute("""
             UPDATE stats SET
                 total_requests = total_requests + ?,
                 success_requests = success_requests + ?,
@@ -235,34 +237,75 @@ def update_stats(req=0, success=0, err=0, files=0):
 
 
 def get_stats():
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db() as conn:
         c = conn.cursor()
         c.execute("SELECT total_requests, success_requests, error_requests, files_processed FROM stats WHERE id = 1")
         st = c.fetchone()
         c.execute("SELECT COUNT(*) FROM users")
-        users_cnt = c.fetchone()[0]
+        u_cnt = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM chats")
-        chats_cnt = c.fetchone()[0]
-        return {
-            "total": st[0], "success": st[1], "errors": st[2], "files": st[3],
-            "users": users_cnt, "chats": chats_cnt
-        }
+        c_cnt = c.fetchone()[0]
+        return {"total": st[0], "success": st[1], "errors": st[2], "files": st[3], "users": u_cnt, "chats": c_cnt}
 
 
 # =====================================================================
-# 🎹 КЛАВИАТУРЫ И НАВИГАЦИЯ
+# 🧹 АВТООЧИСТКА (ФАЙЛЫ > 10 МБ ЧЕРЕЗ 24Ч, ДИАЛОГИ ЧЕРЕЗ 7 ДНЕЙ)
+# =====================================================================
+async def run_cleanup():
+    now = time.time()
+    large_cutoff = now - LARGE_FILE_TTL_SECONDS
+    small_cutoff = now - SMALL_FILE_TTL_SECONDS
+    chat_cutoff = now - CHAT_TTL_SECONDS
+
+    api_files_to_delete = []
+    with get_db() as conn:
+        c = conn.cursor()
+        # 1. Находим файлы > 10 МБ старше 24ч, остальные медиа старше 48ч и файлы из удаляемых чатов (> 7 дней)
+        c.execute("""
+            SELECT msg_id, file_api_name FROM messages
+            WHERE file_uri IS NOT NULL AND (
+                (file_size >= ? AND created_at < ?) OR
+                (created_at < ?) OR
+                (chat_id IN (SELECT chat_id FROM chats WHERE created_at < ?))
+            )
+        """, (LARGE_FILE_BYTES, large_cutoff, small_cutoff, chat_cutoff))
+        for msg_id, f_name in c.fetchall():
+            if f_name:
+                api_files_to_delete.append(f_name)
+            c.execute("UPDATE messages SET file_uri=NULL, file_mime=NULL, file_api_name=NULL WHERE msg_id=?", (msg_id,))
+
+        # 2. Удаляем все диалоги и сообщения старше 7 дней
+        c.execute("DELETE FROM chats WHERE created_at < ?", (chat_cutoff,))
+        c.execute("DELETE FROM messages WHERE created_at < ? OR chat_id NOT IN (SELECT chat_id FROM chats)", (chat_cutoff,))
+        conn.commit()
+
+    for f_name in set(api_files_to_delete):
+        try:
+            await client.aio.files.delete(name=f_name)
+        except Exception:
+            pass
+
+    with get_db() as conn:
+        conn.execute("VACUUM")
+    gc.collect()
+
+
+async def background_cleanup_loop():
+    while True:
+        try:
+            await run_cleanup()
+        except Exception as e:
+            logger.error(f"Ошибка автоочистки: {e}")
+        await asyncio.sleep(CLEANUP_INTERVAL)
+
+
+# =====================================================================
+# 🎹 КЛАВИАТУРЫ И СПИСОК МОДЕЛЕЙ
 # =====================================================================
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     kb = [
-        [
-            KeyboardButton(text="⬅️ Прошлый чат"),
-            KeyboardButton(text="➕ Новый чат"),
-            KeyboardButton(text="➡️ Следующий чат"),
-        ],
-        [
-            KeyboardButton(text="🗂 Все чаты"),
-            KeyboardButton(text="🤖 Выбор модели"),
-        ]
+        [KeyboardButton(text="⬅️ Прошлый чат"), KeyboardButton(text="➕ Новый чат"), KeyboardButton(text="➡️ Следующий чат")],
+        [KeyboardButton(text="🗂 Все чаты"), KeyboardButton(text="🤖 Выбор модели")]
     ]
     if user_id in ADMIN_IDS:
         kb[1].append(KeyboardButton(text="📊 Админ"))
@@ -270,21 +313,16 @@ def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 
 
 def get_response_export_kb(db_msg_id: int, has_code: bool) -> InlineKeyboardMarkup:
-    buttons = [
+    rows = [[
         InlineKeyboardButton(text="📄 Скачать .txt", callback_data=f"export:txt:{db_msg_id}"),
         InlineKeyboardButton(text="📝 Скачать .md", callback_data=f"export:md:{db_msg_id}"),
-    ]
-    rows = [buttons]
+    ]]
     if has_code:
         rows.append([InlineKeyboardButton(text="💻 Выгрузить код файлом", callback_data=f"export:code:{db_msg_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# =====================================================================
-# 🤖 ПОЛУЧЕНИЕ И СОРТИРОВКА МОДЕЛЕЙ (ОТ НОВЫХ К СТАРЫМ)
-# =====================================================================
 def parse_model_sort_key(model_name: str):
-    """Ключ сортировки: ставит Gemini 4 (Carbon, Argon, Hydrogen) и новые версии наверх."""
     ver_match = re.search(r"(\d+)\.(\d+)", model_name)
     if ver_match:
         major, minor = int(ver_match.group(1)), int(ver_match.group(2))
@@ -293,272 +331,183 @@ def parse_model_sort_key(model_name: str):
         major = int(single_ver.group(1)) if single_ver else 0
         minor = 0
 
-    # Приоритет внутри одной версии
     tier = 1
-    if "carbon" in model_name:
-        tier = 6
-    elif "argon" in model_name:
-        tier = 5
-    elif "hydrogen" in model_name:
-        tier = 4
-    elif "pro" in model_name:
-        tier = 3
-    elif "flash" in model_name and "lite" not in model_name:
-        tier = 2
+    if "carbon" in model_name: tier = 6
+    elif "argon" in model_name: tier = 5
+    elif "hydrogen" in model_name: tier = 4
+    elif "pro" in model_name: tier = 3
+    elif "flash" in model_name and "lite" not in model_name: tier = 2
 
     is_latest = 1 if ("latest" in model_name or "preview" in model_name or "exp" in model_name) else 0
     return (major, minor, tier, is_latest, model_name)
+
 
 async def fetch_sorted_models(force=False) -> list[str]:
     global MODELS_CACHE
     if MODELS_CACHE and not force:
         return MODELS_CACHE
 
+    fallback = [
+        "gemini-4-carbon", "gemini-4-argon", "gemini-4-hydrogen",
+        "gemini-3.8-flash", "gemini-3.5-flash-lite",
+        "gemini-2.5-pro", "gemini-2.5-flash", "imagen-3.0-generate-002",
+    ]
     try:
-        raw_models = []
+        raw_models = set(fallback)
         pager = await client.aio.models.list()
         async for m in pager:
             name = m.name.replace("models/", "")
-            # Оставляем только генеративные модели Gemini и Imagen (исключаем технических/embedding)
             if any(x in name for x in ["embedding", "aqa", "bison", "gecko", "learnlm"]):
                 continue
             if name.startswith("gemini") or name.startswith("imagen"):
-                raw_models.append(name)
-
-        # Сортируем по убыванию (от самых новых к самым старым)
-        raw_models = sorted(list(set(raw_models)), key=parse_model_sort_key, reverse=True)
-        if raw_models:
-            MODELS_CACHE = raw_models
-            return MODELS_CACHE
-    except Exception as e:
-        logger.error(f"Ошибка получения списка моделей: {e}")
-
-    # Резервный список, если API не вернул каталог
-    return [
-        "gemini-4-carbon",
-        "gemini-4-argon",
-        "gemini-4-hydrogen",
-        "gemini-3.8-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
-        "imagen-3.0-generate-002",
-    ]
+                raw_models.add(name)
+        MODELS_CACHE = sorted(list(raw_models), key=parse_model_sort_key, reverse=True)
+        return MODELS_CACHE
+    except Exception:
+        return sorted(fallback, key=parse_model_sort_key, reverse=True)
 
 
 async def build_models_keyboard(user_id: int, page: int = 0) -> InlineKeyboardMarkup:
     models = await fetch_sorted_models()
     current_model, _ = ensure_user(user_id)
-
     per_page = 7
     total_pages = max(1, (len(models) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
-
-    start_idx = page * per_page
-    page_models = models[start_idx : start_idx + per_page]
+    page_models = models[page * per_page : (page + 1) * per_page]
 
     rows = []
     for idx, m in enumerate(page_models):
         prefix = "✅ " if m == current_model else ""
-        badge = "🔥 " if (start_idx + idx) < 3 else ""
+        badge = "🔥 " if (page * per_page + idx) < 3 else ""
         rows.append([InlineKeyboardButton(text=f"{prefix}{badge}{m}", callback_data=f"setmodel:{m}:{page}")])
 
-    nav_row = []
+    nav = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"modelpage:{page - 1}"))
-    nav_row.append(InlineKeyboardButton(text=f"Стр. {page + 1}/{total_pages}", callback_data="noop"))
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"modelpage:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
     if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"modelpage:{page + 1}"))
-
-    rows.append(nav_row)
-    rows.append([InlineKeyboardButton(text="🔄 Обновить список из API", callback_data="modelpage:refresh")])
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"modelpage:{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔄 Обновить из API", callback_data="modelpage:refresh")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # =====================================================================
-# 🚨 ФОНОВЫЙ МОНИТОРИНГ СЕРВЕРА И API (КАЖДЫЕ 10 МИНУТ)
+# 🚨 МОНИТОРИНГ СЕРВЕРА (КАЖДЫЕ 10 МИНУТ) И /admin
 # =====================================================================
 async def check_service_health() -> tuple[bool, str, int]:
-    """Проверяет доступность Gemini API и ресурсы сервера."""
     t0 = time.monotonic()
     try:
-        # Легкий запрос к API для проверки связи
-        await asyncio.wait_for(
-            client.aio.models.get(model=DEFAULT_MODEL),
-            timeout=15.0
-        )
+        await asyncio.wait_for(client.aio.models.list(), timeout=15.0)
         ping_ms = int((time.monotonic() - t0) * 1000)
-
-        cpu = psutil.cpu_percent(interval=0.5)
+        cpu = psutil.cpu_percent(interval=0.4)
         ram = psutil.virtual_memory().percent
-
-        if cpu > 95 or ram > 95:
-            return False, f"Перегрузка железа! CPU: {cpu}%, RAM: {ram}%", ping_ms
-
+        if cpu > 92 or ram > 92:
+            return False, f"Перегрузка VPS (1GB)! CPU: {cpu}%, RAM: {ram}%", ping_ms
         return True, "OK", ping_ms
     except Exception as e:
-        ping_ms = int((time.monotonic() - t0) * 1000)
-        return False, f"{type(e).__name__}: {str(e)[:150]}", ping_ms
+        return False, f"{type(e).__name__}: {str(e)[:120]}", int((time.monotonic() - t0) * 1000)
 
 
 async def background_health_monitor():
-    """Фоновый цикл: каждые 10 минут проверяет сервис и бьет тревогу, если серверу бо-бо."""
     while True:
         await asyncio.sleep(HEALTH_CHECK_INTERVAL)
         ok, details, ping_ms = await check_service_health()
         now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-
-        HEALTH_STATE["is_healthy"] = ok
-        HEALTH_STATE["last_ping_ms"] = ping_ms
-        HEALTH_STATE["last_check"] = now_str
+        HEALTH_STATE.update({"is_healthy": ok, "last_ping_ms": ping_ms})
         if not ok:
             HEALTH_STATE["last_error"] = f"[{now_str}] {details}"
-
-        if not ok and HEALTH_STATE["alerts_enabled"]:
-            alert_text = (
-                "🚨 <b>ВНИМАНИЕ! СЕРВЕРУ БО-БО!</b> 🚨\n\n"
-                f"🕒 <b>Время:</b> {now_str}\n"
-                f"⚠️ <b>Причина:</b> <code>{details}</code>\n"
-                f"📡 <b>Пинг:</b> {ping_ms} мс\n"
-                f"💻 <b>CPU:</b> {psutil.cpu_percent()}% | <b>RAM:</b> {psutil.virtual_memory().percent}%"
-            )
-            for admin_id in ADMIN_IDS:
-                try:
-                    await bot.send_message(admin_id, alert_text, parse_mode="HTML")
-                except Exception as ex:
-                    logger.error(f"Не удалось отправить алерт админу {admin_id}: {ex}")
-
-
-# =====================================================================
-# 🛠 АДМИН-ПАНЕЛЬ (/admin)
-# =====================================================================
-def format_uptime(seconds: float) -> str:
-    td = datetime.timedelta(seconds=int(seconds))
-    days = td.days
-    hours, rem = divmod(td.seconds, 3600)
-    minutes, secs = divmod(rem, 60)
-    return f"{days}д {hours}ч {minutes}м {secs}с"
+            if HEALTH_STATE["alerts_enabled"]:
+                msg = (
+                    f"🚨 <b>СЕРВЕРУ БО-БО!</b>\n🕒 {now_str}\n"
+                    f"⚠️ Причина: <code>{details}</code>\n"
+                    f"💻 CPU: {psutil.cpu_percent()}% | RAM: {psutil.virtual_memory().percent}%"
+                )
+                for adm in ADMIN_IDS:
+                    try:
+                        await bot.send_message(adm, msg, parse_mode="HTML")
+                    except Exception:
+                        pass
 
 
 async def render_admin_dashboard() -> tuple[str, InlineKeyboardMarkup]:
     ok, details, ping_ms = await check_service_health()
-    now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-    HEALTH_STATE["is_healthy"] = ok
-    HEALTH_STATE["last_ping_ms"] = ping_ms
-    HEALTH_STATE["last_check"] = now_str
-    if not ok:
-        HEALTH_STATE["last_error"] = f"[{now_str}] {details}"
-
     st = get_stats()
-    uptime_str = format_uptime(time.time() - START_TIME)
-    cpu = psutil.cpu_percent()
+    td = datetime.timedelta(seconds=int(time.time() - START_TIME))
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage("/")
-
-    status_Icon = "🟢 РАБОТАЕТ ШТАТНО" if ok else "🔴 СЕРВЕРУ БО-БО (СБОЙ)"
-    alerts_status = "🔔 Включены (каждые 10 мин)" if HEALTH_STATE["alerts_enabled"] else "🔕 Выключены"
+    status_str = "🟢 OK" if ok else f"🔴 БО-БО ({details})"
 
     text = (
-        f"📊 <b>АДМИН-ПАНЕЛЬ И МОНИТОРИНГ</b>\n"
+        f"📊 <b>АДМИН-ПАНЕЛЬ (1 CPU / 1 GB RAM)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Статус сервиса:</b> {status_Icon}\n"
-        f"<b>Пинг до Gemini API:</b> <code>{ping_ms} мс</code>\n"
-        f"<b>Рантайм (Uptime):</b> <code>{uptime_str}</code>\n"
-        f"<b>Алерты (10 мин):</b> {alerts_status}\n"
-        f"<b>Последняя ошибка:</b> <code>{HEALTH_STATE['last_error'] or 'Нет ошибок'}</code>\n\n"
-        f"📈 <b>Статистика запросов:</b>\n"
-        f"• Всего запросов: <b>{st['total']}</b>\n"
-        f"• Успешных: <b>{st['success']}</b> | Ошибок: <b>{st['errors']}</b>\n"
-        f"• Обработано файлов: <b>{st['files']}</b>\n"
-        f"• Пользователей: <b>{st['users']}</b> | Чатов: <b>{st['chats']}</b>\n\n"
-        f"🖥 <b>Ресурсы сервера:</b>\n"
-        f"• CPU: <code>{cpu}%</code>\n"
-        f"• RAM: <code>{mem.percent}% ({mem.used // (1024**2)} / {mem.total // (1024**2)} МБ)</code>\n"
+        f"• Статус: <b>{status_str}</b>\n"
+        f"• Пинг Gemini API: <code>{ping_ms} мс</code>\n"
+        f"• Рантайм: <code>{td}</code>\n"
+        f"• Запросы: <b>{st['total']}</b> (OK: {st['success']} | Err: {st['errors']})\n"
+        f"• Файлов прокачано: <b>{st['files']}</b> | Чатов (7д): <b>{st['chats']}</b>\n\n"
+        f"🖥 <b>Ресурсы VPS:</b>\n"
+        f"• CPU: <code>{psutil.cpu_percent()}%</code>\n"
+        f"• RAM: <code>{mem.percent}% ({mem.used // (1024**2)}/{mem.total // (1024**2)} МБ)</code>\n"
         f"• Диск: <code>{disk.percent}%</code>"
     )
-
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить показатели", callback_data="admin:refresh")],
-        [
-            InlineKeyboardButton(
-                text="🔕 Выкл алерты" if HEALTH_STATE["alerts_enabled"] else "🔔 Вкл алерты",
-                callback_data="admin:toggle_alerts"
-            ),
-            InlineKeyboardButton(text="🚨 Тест «Серверу бо-бо»", callback_data="admin:test_alert"),
-        ]
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:refresh"),
+         InlineKeyboardButton(text="🧹 Очистить старое", callback_data="admin:cleanup")],
+        [InlineKeyboardButton(text="🔔 Вкл/Выкл алерты", callback_data="admin:toggle_alerts"),
+         InlineKeyboardButton(text="🚨 Тест «Бо-бо»", callback_data="admin:test_alert")]
     ])
     return text, kb
 
 
 # =====================================================================
-# 📌 ОБРАБОТЧИКИ КОМАНД И КНОПОК МЕНЮ
+# 📌 ОБРАБОТЧИКИ КОМАНД
 # =====================================================================
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     model, chat_id = ensure_user(message.from_user.id)
     await message.answer(
-        f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
-        f"Я универсальный бот на базе <b>Google Gemini AI</b>.\n"
-        f"🔹 Принимаю <b>любые форматы</b>: текст, код, фото, видео, голосовые, кружочки, аудио, PDF и документы.\n"
-        f"🔹 Выгружаю ответы текстом, кодом, файлами и изображениями.\n"
-        f"🔹 Поддерживаю переключение между прошлыми и новыми чатами.\n\n"
-        f"🤖 Текущая модель: <code>{model}</code>\n"
-        f"💬 Активный чат: <code>#{chat_id}</code>",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(message.from_user.id)
+        f"👋 <b>Привет!</b>\n🤖 Модель: <code>{model}</code> | Чат: <code>#{chat_id}</code>\n"
+        f"<i>История хранится в тексте 7 дней. Файлы > 10 МБ удаляются через 24 часа.</i>",
+        parse_mode="HTML", reply_markup=get_main_keyboard(message.from_user.id)
     )
 
 
 @dp.message(Command("admin"))
 @dp.message(F.text == "📊 Админ")
 async def cmd_admin(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("⛔ У вас нет прав администратора.")
-        return
-    text, kb = await render_admin_dashboard()
-    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+    if message.from_user.id in ADMIN_IDS:
+        text, kb = await render_admin_dashboard()
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("admin:"))
 async def cb_admin(call: CallbackQuery):
     if call.from_user.id not in ADMIN_IDS:
-        await call.answer("Нет доступа", show_alert=True)
         return
-
-    action = call.data.split(":")[1]
-    if action == "refresh":
-        text, kb = await render_admin_dashboard()
-        try:
-            await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        except Exception:
-            pass
-        await call.answer("Данные обновлены!")
-    elif action == "toggle_alerts":
+    act = call.data.split(":")[1]
+    if act == "cleanup":
+        await run_cleanup()
+        await call.answer("Очистка завершена, ОЗУ освобождено!")
+    elif act == "toggle_alerts":
         HEALTH_STATE["alerts_enabled"] = not HEALTH_STATE["alerts_enabled"]
-        text, kb = await render_admin_dashboard()
+        await call.answer(f"Алерты: {HEALTH_STATE['alerts_enabled']}")
+    elif act == "test_alert":
+        await call.message.answer("🚨 <b>ТЕСТ: СЕРВЕРУ БО-БО!</b>", parse_mode="HTML")
+        await call.answer()
+    text, kb = await render_admin_dashboard()
+    try:
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        await call.answer("Настройка уведомлений изменена")
-    elif action == "test_alert":
-        await call.message.answer(
-            "🚨 <b>ТЕСТОВАЯ ТРЕВОГА: СЕРВЕРУ БО-БО!</b> 🚨\n"
-            "Система оповещений раз в 10 минут исправна.",
-            parse_mode="HTML"
-        )
-        await call.answer("Тестовый алерт отправлен!")
+    except Exception:
+        pass
 
 
-# --- ВЫБОР МОДЕЛИ ---
 @dp.message(Command("models"))
 @dp.message(F.text == "🤖 Выбор модели")
 async def cmd_models(message: Message):
     model, _ = ensure_user(message.from_user.id)
-    kb = await build_models_keyboard(message.from_user.id, page=0)
-    await message.answer(
-        f"🤖 <b>Выберите модель ИИ</b> (отсортированы от самых новых к старым):\n"
-        f"Текущая: <code>{model}</code>",
-        parse_mode="HTML",
-        reply_markup=kb
-    )
+    kb = await build_models_keyboard(message.from_user.id, 0)
+    await message.answer(f"🤖 <b>Текущая модель:</b> <code>{model}</code>", parse_mode="HTML", reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("modelpage:"))
@@ -567,372 +516,194 @@ async def cb_model_page(call: CallbackQuery):
     if arg == "refresh":
         await fetch_sorted_models(force=True)
         page = 0
-        await call.answer("Список моделей обновлен из Google API!")
     else:
         page = int(arg)
-
     model, _ = ensure_user(call.from_user.id)
-    kb = await build_models_keyboard(call.from_user.id, page=page)
-    await call.message.edit_text(
-        f"🤖 <b>Выберите модель ИИ</b> (от новых к старым):\nТекущая: <code>{model}</code>",
-        parse_mode="HTML",
-        reply_markup=kb
-    )
+    kb = await build_models_keyboard(call.from_user.id, page)
+    await call.message.edit_text(f"🤖 <b>Текущая модель:</b> <code>{model}</code>", parse_mode="HTML", reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("setmodel:"))
 async def cb_set_model(call: CallbackQuery):
     _, new_model, page_str = call.data.split(":")
     set_user_model(call.from_user.id, new_model)
-    kb = await build_models_keyboard(call.from_user.id, page=int(page_str))
-    await call.message.edit_text(
-        f"✅ <b>Модель успешно изменена!</b>\nТекущая: <code>{new_model}</code>",
-        parse_mode="HTML",
-        reply_markup=kb
-    )
-    await call.answer(f"Выбрана {new_model}")
+    kb = await build_models_keyboard(call.from_user.id, int(page_str))
+    await call.message.edit_text(f"✅ <b>Выбрана модель:</b> <code>{new_model}</code>", parse_mode="HTML", reply_markup=kb)
 
 
-# --- НАВИГАЦИЯ ПО ЧАТАМ (НОВЫЙ / ПРОШЛЫЙ / СЛЕДУЮЩИЙ / СПИСОК) ---
 @dp.message(F.text == "➕ Новый чат")
 @dp.message(Command("new"))
 async def cmd_new_chat(message: Message):
     ensure_user(message.from_user.id)
-    chat_id = create_new_chat(message.from_user.id)
-    await message.answer(
-        f"✨ <b>Создан новый чат #{chat_id}!</b>\nОтправьте сообщение, код или любой файл.",
-        parse_mode="HTML"
-    )
+    cid = create_new_chat(message.from_user.id)
+    await message.answer(f"✨ <b>Создан новый чат #{cid}!</b>", parse_mode="HTML")
 
 
-async def switch_adjacent_chat(message: Message, direction: int):
-    """Переключает на прошлый (-1) или следующий (+1) чат."""
-    _, active_chat_id = ensure_user(message.from_user.id)
+async def switch_chat(message: Message, delta: int):
+    _, active_id = ensure_user(message.from_user.id)
     chats = get_user_chats(message.from_user.id)
-    chat_ids = [c[0] for c in chats]
-
-    if active_chat_id not in chat_ids:
+    ids = [c[0] for c in chats]
+    if active_id not in ids:
         return
-
-    idx = chat_ids.index(active_chat_id)
-    target_idx = idx + direction
-
-    if target_idx < 0:
-        await message.answer("⬅️ Вы уже находитесь в самом первом (старом) чате.")
-        return
-    if target_idx >= len(chat_ids):
-        await message.answer("➡️ Вы уже в самом последнем чате. Нажмите «➕ Новый чат», чтобы создать новый.")
-        return
-
-    new_chat_id, title, created_at = chats[target_idx]
-    set_active_chat(message.from_user.id, new_chat_id)
-    msgs = get_chat_messages(new_chat_id)
-
-    preview = ""
-    if msgs:
-        last_msgs = msgs[-2:]
-        preview_lines = []
-        for r, txt, _, _, _ in last_msgs:
-            who = "👤 Вы" if r == "user" else "🤖 ИИ"
-            short = (txt or "[Файл]").replace("\n", " ")[:80]
-            preview_lines.append(f"{who}: <i>{short}...</i>")
-        preview = "\n\n<b>Последние сообщения:</b>\n" + "\n".join(preview_lines)
-
-    await message.answer(
-        f"📂 <b>Переключено на чат #{new_chat_id}</b> ({target_idx + 1} из {len(chats)})\n"
-        f"📌 Тема: <b>{title}</b>\n"
-        f"🕒 Создан: <code>{created_at}</code>"
-        f"{preview}",
-        parse_mode="HTML"
-    )
+    idx = ids.index(active_id) + delta
+    if 0 <= idx < len(chats):
+        cid, title, _ = chats[idx]
+        set_active_chat(message.from_user.id, cid)
+        await message.answer(f"📂 <b>Чат #{cid}:</b> {title}", parse_mode="HTML")
+    else:
+        await message.answer("⚠️ Крайний чат в списке.")
 
 
 @dp.message(F.text == "⬅️ Прошлый чат")
-async def cmd_prev_chat(message: Message):
-    await switch_adjacent_chat(message, direction=-1)
+async def cmd_prev(message: Message):
+    await switch_chat(message, -1)
 
 
 @dp.message(F.text == "➡️ Следующий чат")
-async def cmd_next_chat(message: Message):
-    await switch_adjacent_chat(message, direction=1)
+async def cmd_next(message: Message):
+    await switch_chat(message, 1)
 
 
 @dp.message(F.text == "🗂 Все чаты")
-@dp.message(Command("chats"))
 async def cmd_all_chats(message: Message):
-    _, active_chat_id = ensure_user(message.from_user.id)
+    _, active_id = ensure_user(message.from_user.id)
     chats = get_user_chats(message.from_user.id)
-
-    rows = []
-    for c_id, title, _ in reversed(chats[-15:]):  # Показываем последние 15 чатов
-        mark = "🟢 " if c_id == active_chat_id else "💬 "
-        rows.append([InlineKeyboardButton(text=f"{mark}#{c_id}: {title}", callback_data=f"selectchat:{c_id}")])
-
-    rows.append([InlineKeyboardButton(text="➕ Создать новый чат", callback_data="selectchat:new")])
-    await message.answer(
-        "🗂 <b>Ваши диалоги</b> (нажмите для переключения):",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
-    )
+    rows = [[InlineKeyboardButton(text=f"{'🟢' if c[0]==active_id else '💬'} #{c[0]}: {c[1]}", callback_data=f"selchat:{c[0]}")] for c in reversed(chats[-15:])]
+    rows.append([InlineKeyboardButton(text="➕ Новый чат", callback_data="selchat:new")])
+    await message.answer("🗂 <b>Чаты за последние 7 дней:</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
-@dp.callback_query(F.data.startswith("selectchat:"))
-async def cb_select_chat(call: CallbackQuery):
+@dp.callback_query(F.data.startswith("selchat:"))
+async def cb_sel_chat(call: CallbackQuery):
     arg = call.data.split(":")[1]
-    if arg == "new":
-        chat_id = create_new_chat(call.from_user.id)
-        await call.message.edit_text(f"✨ <b>Создан и выбран новый чат #{chat_id}!</b>", parse_mode="HTML")
-        return
-
-    chat_id = int(arg)
-    set_active_chat(call.from_user.id, chat_id)
-    msgs = get_chat_messages(chat_id)
-    await call.message.edit_text(
-        f"✅ <b>Активен чат #{chat_id}</b>\nСообщений в истории: <b>{len(msgs)}</b>",
-        parse_mode="HTML"
-    )
-    await call.answer(f"Выбран чат #{chat_id}")
+    cid = create_new_chat(call.from_user.id) if arg == "new" else int(arg)
+    set_active_chat(call.from_user.id, cid)
+    await call.message.edit_text(f"✅ <b>Активен чат #{cid}</b>", parse_mode="HTML")
 
 
-# =====================================================================
-# 📥 ЭКСПОРТ ОТВЕТОВ ВО ВСЕ ФОРМАТЫ (.TXT, .MD, ФАЙЛЫ С КОДОМ)
-# =====================================================================
 @dp.callback_query(F.data.startswith("export:"))
-async def cb_export_response(call: CallbackQuery):
-    _, fmt, msg_id_str = call.data.split(":")
-    text = get_message_by_id(int(msg_id_str))
+async def cb_export(call: CallbackQuery):
+    _, fmt, mid = call.data.split(":")
+    text = get_message_by_id(int(mid))
     if not text:
-        await call.answer("Текст сообщения не найден в БД", show_alert=True)
-        return
-
+        return await call.answer("Сообщение уже удалено", show_alert=True)
     if fmt in ("txt", "md"):
-        file_bytes = text.encode("utf-8")
-        doc = BufferedInputFile(file_bytes, filename=f"gemini_response_{msg_id_str}.{fmt}")
-        await call.message.answer_document(doc, caption=f"📄 Ответ сохранен в формате .{fmt}")
-        await call.answer()
-
+        await call.message.answer_document(BufferedInputFile(text.encode("utf-8"), filename=f"msg_{mid}.{fmt}"))
     elif fmt == "code":
-        pattern = re.compile(r"```(\w+)?\n(.*?)```", re.DOTALL)
-        matches = pattern.findall(text)
-        if not matches:
-            await call.answer("Блоки кода не найдены", show_alert=True)
-            return
-
-        for idx, (lang, code_content) in enumerate(matches, start=1):
+        for i, (lang, code) in enumerate(re.findall(r"```(\w+)?\n(.*?)```", text, re.DOTALL), 1):
             ext = LANG_EXT_MAP.get(lang.lower().strip(), "txt") if lang else "txt"
-            filename = f"code_{msg_id_str}_{idx}.{ext}"
-            doc = BufferedInputFile(code_content.strip().encode("utf-8"), filename=filename)
-            await call.message.answer_document(doc, caption=f"💻 Блок кода #{idx} ({lang or 'text'})")
-        await call.answer("Код выгружен файлами!")
+            await call.message.answer_document(BufferedInputFile(code.strip().encode("utf-8"), filename=f"code_{mid}_{i}.{ext}"))
+    await call.answer()
 
 
 # =====================================================================
-# 📎 ОБРАБОТКА ВСЕХ ТИПОВ ФАЙЛОВ И СООБЩЕНИЙ
+# 📎 ПОТОКОВАЯ ОБРАБОТКА ВСЕХ ФАЙЛОВ И СООБЩЕНИЙ
 # =====================================================================
-async def extract_telegram_Attachment(message: Message) -> tuple[str | None, str | None, str | None, str | None]:
-    """
-    Извлекает любой медиафайл или документ из сообщения Telegram.
-    Возвращает: (file_id, file_name, mime_type, local_ext)
-    """
-    if message.photo:
-        ph = message.photo[-1]
-        return ph.file_id, "photo.jpg", "image/jpeg", ".jpg"
-    if message.video:
-        v = message.video
-        return v.file_id, v.file_name or "video.mp4", v.mime_type or "video/mp4", ".mp4"
-    if message.video_note:
-        vn = message.video_note
-        return vn.file_id, "video_note.mp4", "video/mp4", ".mp4"
-    if message.voice:
-        vc = message.voice
-        return vc.file_id, "voice.ogg", vc.mime_type or "audio/ogg", ".ogg"
-    if message.audio:
-        au = message.audio
-        ext = Path(au.file_name).suffix if au.file_name else ".mp3"
-        return au.file_id, au.file_name or f"audio{ext}", au.mime_type or "audio/mpeg", ext
-    if message.sticker:
-        st = message.sticker
-        if st.is_video:
-            return st.file_id, "sticker.webm", "video/webm", ".webm"
-        return st.file_id, "sticker.webp", "image/webp", ".webp"
-    if message.document:
-        doc = message.document
-        ext = Path(doc.file_name).suffix.lower() if doc.file_name else ""
-        return doc.file_id, doc.file_name or "document", doc.mime_type or "application/octet-stream", ext
-
-    return None, None, None, None
-
-
-async def send_smart_response(message: Message, response, db_msg_id: int):
-    """Отправляет все типы данных из ответа Gemini: текст, изображения, аудио, файлы."""
-    # Проверяем наличие встроенных медиафайлов (картинок/аудио) в ответе модели
-    if response.candidates:
-        for cand in response.candidates:
-            if not cand.content or not cand.content.parts:
-                continue
-            for part in cand.content.parts:
-                if part.inline_data and part.inline_data.data:
-                    mime = part.inline_data.mime_type or "application/octet-stream"
-                    raw_bytes = part.inline_data.data
-                    if mime.startswith("image/"):
-                        ext = mime.split("/")[-1]
-                        await message.answer_photo(
-                            BufferedInputFile(raw_bytes, filename=f"generated.{ext}"),
-                            caption="🖼 Сгенерированное изображение"
-                        )
-                    elif mime.startswith("audio/"):
-                        ext = mime.split("/")[-1]
-                        await message.answer_audio(
-                            BufferedInputFile(raw_bytes, filename=f"audio.{ext}"),
-                            caption="🔊 Аудио от Gemini"
-                        )
-                    else:
-                        await message.answer_document(
-                            BufferedInputFile(raw_bytes, filename="output.bin")
-                        )
-
-    text = ""
-    try:
-        text = response.text or ""
-    except Exception:
-        pass
-
-    if not text:
-        return
-
-    has_code = "```" in text
-    kb = get_response_export_kb(db_msg_id, has_code)
-
-    # Разбиваем длинный текст на части по 4000 символов (лимит Telegram — 4096)
-    chunk_size = 4000
-    chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
-
-    for i, chunk in enumerate(chunks):
-        reply_kb = kb if i == len(chunks) - 1 else None
-        try:
-            await message.answer(chunk, parse_mode="Markdown", reply_markup=reply_kb)
-        except Exception:
-            # Если Markdown невалидный из-за спецсимволов в коде, отправляем чистым текстом
-            await message.answer(chunk, reply_markup=reply_kb)
-
-    # Если ответ огромный (> 12 000 символов), дополнительно прикладываем полным файлом
-    if len(text) > 12000:
-        doc = BufferedInputFile(text.encode("utf-8"), filename=f"full_response_{db_msg_id}.md")
-        await message.answer_document(doc, caption="📚 Полный текст ответа в файле")
+async def extract_attachment(m: Message):
+    if m.photo: return m.photo[-1].file_id, "photo.jpg", "image/jpeg", ".jpg", m.photo[-1].file_size or 0
+    if m.video: return m.video.file_id, m.video.file_name or "video.mp4", m.video.mime_type or "video/mp4", ".mp4", m.video.file_size or 0
+    if m.video_note: return m.video_note.file_id, "vnote.mp4", "video/mp4", ".mp4", m.video_note.file_size or 0
+    if m.voice: return m.voice.file_id, "voice.ogg", m.voice.mime_type or "audio/ogg", ".ogg", m.voice.file_size or 0
+    if m.audio:
+        ext = Path(m.audio.file_name).suffix if m.audio.file_name else ".mp3"
+        return m.audio.file_id, m.audio.file_name or f"audio{ext}", m.audio.mime_type or "audio/mpeg", ext, m.audio.file_size or 0
+    if m.document:
+        ext = Path(m.document.file_name).suffix.lower() if m.document.file_name else ""
+        return m.document.file_id, m.document.file_name or "doc", m.document.mime_type or "application/octet-stream", ext, m.document.file_size or 0
+    return None, None, None, None, 0
 
 
 @dp.message()
-async def handle_universal_message(message: Message):
+async def handle_message(message: Message):
     user_id = message.from_user.id
     model_name, chat_id = ensure_user(user_id)
+    prompt = message.text or message.caption or ""
+    file_id, fname, mime, ext, fsize = await extract_attachment(message)
 
-    user_prompt = message.text or message.caption or ""
-    file_id, file_name, mime_type, ext = await extract_telegram_Attachment(message)
-
-    if not user_prompt and not file_id:
-        await message.answer("⚠️ Пожалуйста, отправьте текст, код или любой медиафайл.")
+    if not prompt and not file_id:
         return
 
-    status_msg = await message.answer(f"⏳ <i>Обрабатываю запрос ({model_name})...</i>", parse_mode="HTML")
+    status = await message.answer(f"⏳ <i>Обработка ({model_name})...</i>", parse_mode="HTML")
     update_stats(req=1)
-
-    uploaded_gemini_file = None
-    local_temp_path = None
+    g_file = None
+    tmp_path = None
 
     try:
-        # 1. Если модель семейства Imagen — генерируем картинку
         if model_name.startswith("imagen"):
-            img_res = await client.aio.models.generate_images(
-                model=model_name,
-                prompt=user_prompt or "Beautiful futuristic artwork",
-                config=genai_types.GenerateImagesConfig(number_of_images=1)
+            res = await client.aio.models.generate_images(
+                model=model_name, prompt=prompt or "Art", config=genai_types.GenerateImagesConfig(number_of_images=1)
             )
-            for gen_img in img_res.generated_images:
-                img_bytes = gen_img.image.image_bytes
-                await message.answer_photo(
-                    BufferedInputFile(img_bytes, filename="imagen.png"),
-                    caption=f"🎨 Сгенерировано моделью <code>{model_name}</code>",
-                    parse_mode="HTML"
-                )
+            for img in res.generated_images:
+                await message.answer_photo(BufferedInputFile(img.image.image_bytes, filename="imagen.png"))
+            add_message(chat_id, "user", prompt)
+            add_message(chat_id, "model", f"[Сгенерировано изображение: {prompt}]")
             update_stats(success=1)
-            await status_msg.delete()
-            return
+            return await status.delete()
 
-        # 2. Если прикреплен файл (фото, видео, аудио, кружочек, документ, код)
         if file_id:
             update_stats(files=1)
-            await status_msg.edit_text(f"📥 <i>Скачиваю файл {file_name}...</i>", parse_mode="HTML")
-
-            tg_file = await bot.get_file(file_id)
-            fd, local_temp_path = tempfile.mkstemp(suffix=ext or ".bin")
+            tg_f = await bot.get_file(file_id)
+            fd, tmp_path = tempfile.mkstemp(suffix=ext or ".bin")
             os.close(fd)
-            await bot.download_file(tg_file.file_path, destination=local_temp_path)
+            await bot.download_file(tg_f.file_path, destination=tmp_path)
+            fsize = os.path.getsize(tmp_path) or fsize
 
-            # Проверяем: если это текстовый/кодовый файл — читаем его напрямую в промпт
-            if ext in TEXT_CODE_EXTENSIONS or (mime_type and mime_type.startswith("text/")):
-                with open(local_temp_path, "r", encoding="utf-8", errors="replace") as f:
-                    code_text = f.read()
-                user_prompt = (
-                    f"Содержимое файла `{file_name}`:\n```\n{code_text}\n```\n\n"
-                    f"{user_prompt or 'Проанализируй этот файл/код.'}"
-                )
+            if (ext in TEXT_CODE_EXTENSIONS or (mime and mime.startswith("text/"))) and fsize < 512 * 1024:
+                with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
+                    prompt = f"Файл `{fname}`:\n```\n{f.read()}\n```\n\n{prompt or 'Проанализируй.'}"
+                os.remove(tmp_path)
+                tmp_path = None
             else:
-                # Иначе загружаем через Gemini File API (поддерживает видео, аудио, PDF, фото)
-                await status_msg.edit_text(
-                    f"☁️ <i>Загружаю {file_name} в Google Gemini AI...</i>",
-                    parse_mode="HTML"
+                await status.edit_text(f"☁️ <i>Прокачка {fname} в Google AI...</i>", parse_mode="HTML")
+                g_file = await client.aio.files.upload(
+                    file=tmp_path,
+                    config={"mime_type": mime} if mime and mime != "application/octet-stream" else None
                 )
-                uploaded_gemini_file = await client.aio.files.upload(
-                    file=local_temp_path,
-                    config={"mime_type": mime_type} if mime_type and mime_type != "application/octet-stream" else None
-                )
+                # Сразу стираем локальный файл с диска!
+                os.remove(tmp_path)
+                tmp_path = None
 
-                # Ждем обработки файла (обязательно для видео и больших аудио)
-                while uploaded_gemini_file.state.name == "PROCESSING":
-                    await status_msg.edit_text(
-                        "🎬 <i>Google AI обрабатывает медиафайл, подождите пару секунд...</i>",
-                        parse_mode="HTML"
-                    )
-                    await asyncio.sleep(3)
-                    uploaded_gemini_file = await client.aio.files.get(name=uploaded_gemini_file.name)
+                while g_file.state.name == "PROCESSING":
+                    await asyncio.sleep(2)
+                    g_file = await client.aio.files.get(name=g_file.name)
 
-                if uploaded_gemini_file.state.name == "FAILED":
-                    raise RuntimeError("Не удалось обработать медиафайл на стороне Google AI.")
+                if not prompt:
+                    prompt = f"[Файл: {fname}] Проанализируй содержимое."
 
-                if not user_prompt:
-                    user_prompt = "Подробно проанализируй и опиши этот файл."
-
-        # 3. Сохраняем сообщение пользователя в БД
         add_message(
-            chat_id=chat_id,
-            role="user",
-            text=user_prompt,
-            file_uri=uploaded_gemini_file.uri if uploaded_gemini_file else None,
-            file_mime=uploaded_gemini_file.mime_type if uploaded_gemini_file else None,
+            chat_id, "user", prompt,
+            file_uri=g_file.uri if g_file else None,
+            file_mime=g_file.mime_type if g_file else None,
+            file_api_name=g_file.name if g_file else None,
+            file_size=fsize
         )
 
-        # 4. Собираем историю текущего чата для передачи контекста
-        db_history = get_chat_messages(chat_id)
+        # Собираем историю чата
+        now = time.time()
         contents = []
-        now_ts = time.time()
-
-        for role, txt, f_uri, f_mime, created_ts in db_history:
+        for r_role, r_txt, f_uri, f_mime, f_sz, c_ts in get_chat_messages(chat_id):
             parts = []
-            # Файлы в Gemini File API живут 48 часов (172800 сек)
-            if f_uri and f_mime and (now_ts - created_ts) < 170000:
+            ttl = LARGE_FILE_TTL_SECONDS if (f_sz and f_sz >= LARGE_FILE_BYTES) else SMALL_FILE_TTL_SECONDS
+            if f_uri and f_mime and (now - c_ts) < ttl:
                 parts.append(genai_types.Part.from_uri(file_uri=f_uri, mime_type=f_mime))
-            if txt:
-                parts.append(genai_types.Part.from_text(text=txt))
+            if r_txt:
+                parts.append(genai_types.Part.from_text(text=r_txt))
             if parts:
-                contents.append(genai_types.Content(role=role, parts=parts))
+                contents.append(genai_types.Content(role=r_role, parts=parts))
 
-        await status_msg.edit_text(f"🧠 <i>{model_name} думает...</i>", parse_mode="HTML")
+        response = await client.aio.models.generate_content(model=model_name, contents=contents)
 
-        # 5. Запрос к Gemini API
-        response = await client.aio.models.generate_content(
-            model=model_name,
-            contents=contents,
-        )
+        # Отправляем медиа из ответа, если они есть (не сохраняя их в БД)
+        if response.candidates:
+            for cand in response.candidates:
+                if cand.content and cand.content.parts:
+                    for part in cand.content.parts:
+                        if part.inline_data and part.inline_data.data:
+                            m_type = part.inline_data.mime_type or ""
+                            if m_type.startswith("image/"):
+                                await message.answer_photo(BufferedInputFile(part.inline_data.data, filename="out.png"))
+                            elif m_type.startswith("audio/"):
+                                await message.answer_audio(BufferedInputFile(part.inline_data.data, filename="out.mp3"))
 
         ans_text = ""
         try:
@@ -940,40 +711,36 @@ async def handle_universal_message(message: Message):
         except Exception:
             ans_text = "[Медиа-ответ]"
 
-        db_msg_id = add_message(chat_id=chat_id, role="model", text=ans_text)
+        db_msg_id = add_message(chat_id, "model", ans_text)
         update_stats(success=1)
+        await status.delete()
 
-        await status_msg.delete()
-        await send_smart_response(message, response, db_msg_id)
+        kb = get_response_export_kb(db_msg_id, "```" in ans_text)
+        chunks = [ans_text[i : i + 4000] for i in range(0, len(ans_text), 4000)]
+        for i, ch in enumerate(chunks):
+            r_kb = kb if i == len(chunks) - 1 else None
+            try:
+                await message.answer(ch, parse_mode="Markdown", reply_markup=r_kb)
+            except Exception:
+                await message.answer(ch, reply_markup=r_kb)
 
     except Exception as e:
         update_stats(err=1)
-        logger.exception("Ошибка при обработке сообщения:")
-        await status_msg.edit_text(
-            f"❌ <b>Произошла ошибка:</b>\n<code>{type(e).__name__}: {str(e)[:300]}</code>\n\n"
-            f"💡 Попробуйте сменить модель через кнопку «🤖 Выбор модели» или создать «➕ Новый чат».",
-            parse_mode="HTML"
-        )
+        await status.edit_text(f"❌ <b>Ошибка:</b> <code>{type(e).__name__}: {str(e)[:200]}</code>", parse_mode="HTML")
     finally:
-        if local_temp_path and os.path.exists(local_temp_path):
+        if tmp_path and os.path.exists(tmp_path):
             try:
-                os.remove(local_temp_path)
+                os.remove(tmp_path)
             except OSError:
                 pass
+        gc.collect()
 
 
-# =====================================================================
-# 🚀 ЗАПУСК БОТА
-# =====================================================================
 async def main():
     init_db()
-    logger.info("Кэширование списка моделей...")
     await fetch_sorted_models(force=True)
-
-    # Запускаем фоновый мониторинг (раз в 10 минут)
     asyncio.create_task(background_health_monitor())
-
-    logger.info("Бот запущен!")
+    asyncio.create_task(background_cleanup_loop())
     await dp.start_polling(bot)
 
 
