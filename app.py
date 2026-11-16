@@ -33,7 +33,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "ВАШ_КЛЮЧ_GEMINI_API")
 # Укажите ваш Telegram ID (узнать можно у @userinfobot), чтобы работал /admin и алерты
 ADMIN_IDS = [123456789]
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-4-hydrogen"
 DB_PATH = "gemini_bot.db"
 HEALTH_CHECK_INTERVAL = 600  # 10 минут (в секундах)
 
@@ -284,8 +284,7 @@ def get_response_export_kb(db_msg_id: int, has_code: bool) -> InlineKeyboardMark
 # 🤖 ПОЛУЧЕНИЕ И СОРТИРОВКА МОДЕЛЕЙ (ОТ НОВЫХ К СТАРЫМ)
 # =====================================================================
 def parse_model_sort_key(model_name: str):
-    """Ключ сортировки: ставит самые свежие версии Gemini и Imagen наверх."""
-    # Ищем версию вида 3.0, 2.5, 2.0, 1.5, 1.0
+    """Ключ сортировки: ставит Gemini 4 (Carbon, Argon, Hydrogen) и новые версии наверх."""
     ver_match = re.search(r"(\d+)\.(\d+)", model_name)
     if ver_match:
         major, minor = int(ver_match.group(1)), int(ver_match.group(2))
@@ -294,18 +293,21 @@ def parse_model_sort_key(model_name: str):
         major = int(single_ver.group(1)) if single_ver else 0
         minor = 0
 
-    # Приоритет подтипов внутри одной версии
+    # Приоритет внутри одной версии
     tier = 1
-    if "pro" in model_name:
+    if "carbon" in model_name:
+        tier = 6
+    elif "argon" in model_name:
+        tier = 5
+    elif "hydrogen" in model_name:
         tier = 4
-    elif "flash" in model_name and "lite" not in model_name:
+    elif "pro" in model_name:
         tier = 3
-    elif "imagen" in model_name:
+    elif "flash" in model_name and "lite" not in model_name:
         tier = 2
 
     is_latest = 1 if ("latest" in model_name or "preview" in model_name or "exp" in model_name) else 0
     return (major, minor, tier, is_latest, model_name)
-
 
 async def fetch_sorted_models(force=False) -> list[str]:
     global MODELS_CACHE
@@ -333,12 +335,13 @@ async def fetch_sorted_models(force=False) -> list[str]:
 
     # Резервный список, если API не вернул каталог
     return [
+        "gemini-4-carbon",
+        "gemini-4-argon",
+        "gemini-4-hydrogen",
+        "gemini-3.8-flash",
+        "gemini-3.5-flash-lite",
         "gemini-2.5-pro",
         "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-1.5-pro",
-        "gemini-1.5-flash",
         "imagen-3.0-generate-002",
     ]
 
